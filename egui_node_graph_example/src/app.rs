@@ -76,6 +76,8 @@ pub enum MyNodeTemplate {
     AddScalar,
     SubtractScalar,
     VectorTimesScalar,
+    VectorDot,
+    VectorComponents,
     AddVector,
     SubtractVector,
 }
@@ -135,6 +137,8 @@ impl NodeTemplateTrait for MyNodeTemplate {
             MyNodeTemplate::AddVector => "Vector add",
             MyNodeTemplate::SubtractVector => "Vector subtract",
             MyNodeTemplate::VectorTimesScalar => "Vector times scalar",
+            MyNodeTemplate::VectorDot => "Vector dot",
+            MyNodeTemplate::VectorComponents => "Vector components",
         })
     }
 
@@ -190,6 +194,16 @@ impl NodeTemplateTrait for MyNodeTemplate {
         };
 
         match self {
+            MyNodeTemplate::VectorComponents => {
+                input_vector(graph, "v");
+                output_scalar(graph, "x");
+                output_scalar(graph, "y");
+            }
+            MyNodeTemplate::VectorDot => {
+                input_vector(graph, "u");
+                input_vector(graph, "v");
+                output_scalar(graph, "u.v");
+            }
             MyNodeTemplate::AddScalar => {
                 // The first input param doesn't use the closure so we can comment
                 // it in more detail.
@@ -260,6 +274,8 @@ impl NodeTemplateIter for AllMyNodeTemplates {
             MyNodeTemplate::AddVector,
             MyNodeTemplate::SubtractVector,
             MyNodeTemplate::VectorTimesScalar,
+            MyNodeTemplate::VectorDot,
+            MyNodeTemplate::VectorComponents,
         ]
     }
 }
@@ -507,6 +523,16 @@ pub fn evaluate_node(
     let node = &graph[node_id];
     let mut evaluator = Evaluator::new(graph, outputs_cache, node_id);
     match node.user_data.template {
+        MyNodeTemplate::VectorComponents => {
+            let vector = evaluator.input_vector("v")?;
+            evaluator.output_scalar("x", vector.x)?;
+            evaluator.output_scalar("y", vector.y)
+        }
+        MyNodeTemplate::VectorDot => {
+            let a = evaluator.input_vector("u")?;
+            let b = evaluator.input_vector("v")?;
+            evaluator.output_scalar("u.v", a.dot(b))
+        }
         MyNodeTemplate::AddScalar => {
             let a = evaluator.input_scalar("A")?;
             let b = evaluator.input_scalar("B")?;

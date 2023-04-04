@@ -114,9 +114,12 @@ where
         // (so for windows it will use up to the resizeably set limit
         // and for a Panel it will fill it completely)
         let editor_rect = ui.max_rect();
-        ui.allocate_rect(editor_rect, Sense::hover());
+        let r = ui.allocate_rect(editor_rect, Sense::click_and_drag());
 
-        let cursor_pos = ui.ctx().input().pointer.hover_pos().unwrap_or(Pos2::ZERO);
+        let cursor_pos = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos().unwrap_or(Pos2::ZERO));
+
         let mut cursor_in_editor = editor_rect.contains(cursor_pos);
         let mut cursor_in_finder = false;
 
@@ -163,7 +166,6 @@ where
             delayed_responses.extend(responses);
         }
 
-        let r = ui.allocate_rect(ui.min_rect(), Sense::click().union(Sense::drag()));
         if r.clicked() {
             click_on_background = true;
         } else if r.drag_started() {
@@ -289,7 +291,6 @@ where
         }
 
         /* Handle responses from drawing nodes */
-
         // Some responses generate additional responses when processed. These
         // are stored here to report them back to the user.
         let mut extra_responses: Vec<NodeResponse<UserResponse, NodeData>> = Vec::new();
@@ -353,6 +354,7 @@ where
                             }
                         }
                     }
+                    self.ongoing_box_selection = None;
                 }
                 NodeResponse::User(_) => {
                     // These are handled by the user code.
@@ -395,36 +397,38 @@ where
         /* Mouse input handling */
 
         // This locks the context, so don't hold on to it for too long.
-        let mouse = &ui.ctx().input().pointer;
+        ui.ctx().input(|i| {
+            let mouse = &i.pointer;
 
-        if mouse.any_released() && self.connection_in_progress.is_some() {
-            self.connection_in_progress = None;
-        }
+            if mouse.any_released() && self.connection_in_progress.is_some() {
+                self.connection_in_progress = None;
+            }
 
-        if mouse.secondary_released() && cursor_in_editor && !cursor_in_finder {
-            self.node_finder = Some(NodeFinder::new_at(cursor_pos));
-        }
-        if ui.ctx().input().key_pressed(Key::Escape) {
-            self.node_finder = None;
-        }
+            if mouse.secondary_released() && cursor_in_editor && !cursor_in_finder {
+                self.node_finder = Some(NodeFinder::new_at(cursor_pos));
+            }
+            if i.key_pressed(Key::Escape) {
+                self.node_finder = None;
+            }
 
-        if r.dragged() && ui.ctx().input().pointer.middle_down() {
-            self.pan_zoom.pan += ui.ctx().input().pointer.delta();
-        }
+            if r.dragged() && mouse.middle_down() {
+                self.pan_zoom.pan += mouse.delta();
+            }
 
-        // Deselect and deactivate finder if the editor backround is clicked,
-        // *or* if the the mouse clicks off the ui
-        if click_on_background || (mouse.any_click() && !cursor_in_editor) {
-            self.selected_nodes = Vec::new();
-            self.node_finder = None;
-        }
+            // Deselect and deactivate finder if the editor backround is clicked,
+            // *or* if the the mouse clicks off the ui
+            if click_on_background || (mouse.any_click() && !cursor_in_editor) {
+                self.selected_nodes = Vec::new();
+                self.node_finder = None;
+            }
 
-        if drag_started_on_background && mouse.primary_down() {
-            self.ongoing_box_selection = Some(cursor_pos);
-        }
-        if mouse.primary_released() || drag_released_on_background {
-            self.ongoing_box_selection = None;
-        }
+            if drag_started_on_background && mouse.primary_down() {
+                self.ongoing_box_selection = Some(cursor_pos);
+            }
+            if mouse.primary_released() || drag_released_on_background {
+                self.ongoing_box_selection = None;
+            }
+        });
 
         GraphResponse {
             node_responses: delayed_responses,
@@ -514,208 +518,255 @@ where
         inner_rect.max.x = inner_rect.max.x.max(inner_rect.min.x);
         inner_rect.max.y = inner_rect.max.y.max(inner_rect.min.y);
 
-        let mut child_ui = ui.child_ui(inner_rect, *ui.layout());
         let mut title_height = 0.0;
 
         let mut input_port_heights = vec![];
         let mut output_port_heights = vec![];
 
-        child_ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.add(Label::new(
-                    RichText::new(&self.graph[self.node_id].label)
-                        .text_style(TextStyle::Button)
-                        .color(text_color),
-                ));
-                ui.add_space(8.0); // The size of the little cross icon
-            });
-            ui.add_space(margin.y);
-            title_height = ui.min_size().y;
+        let window_response = Area::new(Id::new((self.node_id, 'w')))
+            .movable(true)
+            .interactable(true)
+            .enabled(true)
+            .show(ui.ctx(), |ui| {
+                // --- Interaction ---
 
-            // First pass: Draw the inner fields. Compute port heights
-            let inputs = self.graph[self.node_id].inputs.clone();
-            for (param_name, param_id) in inputs {
-                if self.graph[param_id].shown_inline {
-                    let height_before = ui.min_rect().bottom();
-                    if self.graph.connection(param_id).is_some() {
-                        ui.label(param_name);
-                    } else {
-                        // NOTE: We want to pass the `user_data` to
-                        // `value_widget`, but we can't since that would require
-                        // borrowing the graph twice. Here, we make the
-                        // assumption that the value is cheaply replaced, and
-                        // use `std::mem::take` to temporarily replace it with a
-                        // dummy value. This requires `ValueType` to implement
-                        // Default, but results in a totally safe alternative.
-                        let mut value = std::mem::take(&mut self.graph[param_id].value);
-                        let node_responses = value.value_widget(
-                            &param_name,
-                            self.node_id,
-                            ui,
-                            user_state,
-                            &self.graph[self.node_id].user_data,
-                        );
-                        self.graph[param_id].value = value;
-                        responses.extend(node_responses.into_iter().map(NodeResponse::User));
+                // Titlebar buttons
+                let can_delete = self.graph.nodes[self.node_id].user_data.can_delete(
+                    self.node_id,
+                    self.graph,
+                    user_state,
+                );
+
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(Label::new(
+                            RichText::new(&self.graph[self.node_id].label)
+                                .text_style(TextStyle::Button)
+                                .color(text_color),
+                        ));
+                        if can_delete && Self::close_button(ui).clicked() {
+                            responses.push(NodeResponse::DeleteNodeUi(self.node_id));
+                        };
+                    });
+                    ui.add_space(margin.y);
+                    title_height = ui.min_size().y;
+
+                    // First pass: Draw the inner fields. Compute port heights
+                    let inputs = self.graph[self.node_id].inputs.clone();
+                    for (param_name, param_id) in inputs {
+                        if self.graph[param_id].shown_inline {
+                            let height_before = ui.min_rect().bottom();
+                            if self.graph.connection(param_id).is_some() {
+                                ui.label(param_name);
+                            } else {
+                                // NOTE: We want to pass the `user_data` to
+                                // `value_widget`, but we can't since that would require
+                                // borrowing the graph twice. Here, we make the
+                                // assumption that the value is cheaply replaced, and
+                                // use `std::mem::take` to temporarily replace it with a
+                                // dummy value. This requires `ValueType` to implement
+                                // Default, but results in a totally safe alternative.
+                                let mut value = std::mem::take(&mut self.graph[param_id].value);
+                                let node_responses = value.value_widget(
+                                    &param_name,
+                                    self.node_id,
+                                    ui,
+                                    user_state,
+                                    &self.graph[self.node_id].user_data,
+                                );
+                                self.graph[param_id].value = value;
+                                responses
+                                    .extend(node_responses.into_iter().map(NodeResponse::User));
+                            }
+                            let height_after = ui.min_rect().bottom();
+                            input_port_heights.push((height_before + height_after) / 2.0);
+                        }
                     }
-                    let height_after = ui.min_rect().bottom();
-                    input_port_heights.push((height_before + height_after) / 2.0);
+
+                    let outputs = self.graph[self.node_id].outputs.clone();
+                    for (param_name, _param) in outputs {
+                        let height_before = ui.min_rect().bottom();
+                        ui.label(&param_name);
+                        let height_after = ui.min_rect().bottom();
+                        output_port_heights.push((height_before + height_after) / 2.0);
+                    }
+
+                    responses.extend(
+                        self.graph[self.node_id]
+                            .user_data
+                            .bottom_ui(ui, self.node_id, self.graph, user_state)
+                            .into_iter(),
+                    );
+                });
+
+                let outer_rect = ui.min_rect();
+
+                let port_left = outer_rect.left();
+                let port_right = outer_rect.right();
+
+                #[allow(clippy::too_many_arguments)]
+                fn draw_port<NodeData, DataType, ValueType, UserResponse, UserState>(
+                    ui: &mut Ui,
+                    graph: &Graph<NodeData, DataType, ValueType>,
+                    node_id: NodeId,
+                    user_state: &mut UserState,
+                    port_pos: Pos2,
+                    responses: &mut Vec<NodeResponse<UserResponse, NodeData>>,
+                    param_id: AnyParameterId,
+                    port_locations: &mut PortLocations,
+                    ongoing_drag: Option<(NodeId, AnyParameterId)>,
+                    is_connected_input: bool,
+                ) where
+                    DataType: DataTypeTrait<UserState>,
+                    UserResponse: UserResponseTrait,
+                    NodeData: NodeDataTrait,
+                {
+                    let port_type = graph.any_param_type(param_id).unwrap();
+
+                    let port_rect = Rect::from_center_size(port_pos, egui::vec2(10.0, 10.0));
+
+                    let sense = if ongoing_drag.is_some() {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    };
+
+                    // Check if the distance between the port and the mouse is the distance to connect
+                    let close_enough = if let Some(pointer_pos) = ui.ctx().pointer_hover_pos() {
+                        port_rect.center().distance(pointer_pos) < DISTANCE_TO_CONNECT
+                    } else {
+                        false
+                    };
+                    let resp = ui.allocate_rect(port_rect, sense);
+
+                    let port_color = if close_enough {
+                        Color32::WHITE
+                    } else {
+                        port_type.data_type_color(user_state)
+                    };
+                    ui.painter()
+                        .circle(port_rect.center(), 5.0, port_color, Stroke::NONE);
+
+                    if resp.drag_started() {
+                        if is_connected_input {
+                            let input = param_id.assume_input();
+                            let corresp_output = graph
+                                .connection(input)
+                                .expect("Connection data should be valid");
+                            responses.push(NodeResponse::DisconnectEvent {
+                                input: param_id.assume_input(),
+                                output: corresp_output,
+                            });
+                        } else {
+                            responses.push(NodeResponse::ConnectEventStarted(node_id, param_id));
+                        }
+                    }
+
+                    if let Some((origin_node, origin_param)) = ongoing_drag {
+                        if origin_node != node_id {
+                            // Don't allow self-loops
+                            if graph.any_param_type(origin_param).unwrap() == port_type
+                                && close_enough
+                                && ui.input(|i| i.pointer.any_released())
+                            {
+                                match (param_id, origin_param) {
+                                    (
+                                        AnyParameterId::Input(input),
+                                        AnyParameterId::Output(output),
+                                    )
+                                    | (
+                                        AnyParameterId::Output(output),
+                                        AnyParameterId::Input(input),
+                                    ) => {
+                                        responses.push(NodeResponse::ConnectEventEnded {
+                                            input,
+                                            output,
+                                        });
+                                    }
+                                    _ => { /* Ignore in-in or out-out connections */ }
+                                }
+                            }
+                        }
+                    }
+
+                    port_locations.insert(param_id, port_rect.center());
                 }
-            }
 
-            let outputs = self.graph[self.node_id].outputs.clone();
-            for (param_name, _param) in outputs {
-                let height_before = ui.min_rect().bottom();
-                ui.label(&param_name);
-                let height_after = ui.min_rect().bottom();
-                output_port_heights.push((height_before + height_after) / 2.0);
-            }
+                // Input ports
+                for ((_, param), port_height) in self.graph[self.node_id]
+                    .inputs
+                    .iter()
+                    .zip(input_port_heights.into_iter())
+                {
+                    let should_draw = match self.graph[*param].kind() {
+                        InputParamKind::ConnectionOnly => true,
+                        InputParamKind::ConstantOnly => false,
+                        InputParamKind::ConnectionOrConstant => true,
+                    };
 
-            responses.extend(
-                self.graph[self.node_id]
-                    .user_data
-                    .bottom_ui(ui, self.node_id, self.graph, user_state)
-                    .into_iter(),
-            );
-        });
+                    if should_draw {
+                        let pos_left = pos2(port_left, port_height);
+                        draw_port(
+                            ui,
+                            self.graph,
+                            self.node_id,
+                            user_state,
+                            pos_left,
+                            &mut responses,
+                            AnyParameterId::Input(*param),
+                            self.port_locations,
+                            self.ongoing_drag,
+                            self.graph.connection(*param).is_some(),
+                        );
+                    }
+                }
+
+                // Output ports
+                for ((_, param), port_height) in self.graph[self.node_id]
+                    .outputs
+                    .iter()
+                    .zip(output_port_heights.into_iter())
+                {
+                    let pos_right = pos2(port_right, port_height);
+                    draw_port(
+                        ui,
+                        self.graph,
+                        self.node_id,
+                        user_state,
+                        pos_right,
+                        &mut responses,
+                        AnyParameterId::Output(*param),
+                        self.port_locations,
+                        self.ongoing_drag,
+                        false,
+                    );
+                }
+            })
+            .response;
 
         // Second pass, iterate again to draw the ports. This happens outside
         // the child_ui because we want ports to overflow the node background.
 
-        let outer_rect = child_ui.min_rect().expand2(margin);
-        let port_left = outer_rect.left();
-        let port_right = outer_rect.right();
+        let outer_rect = window_response.rect;
 
-        #[allow(clippy::too_many_arguments)]
-        fn draw_port<NodeData, DataType, ValueType, UserResponse, UserState>(
-            ui: &mut Ui,
-            graph: &Graph<NodeData, DataType, ValueType>,
-            node_id: NodeId,
-            user_state: &mut UserState,
-            port_pos: Pos2,
-            responses: &mut Vec<NodeResponse<UserResponse, NodeData>>,
-            param_id: AnyParameterId,
-            port_locations: &mut PortLocations,
-            ongoing_drag: Option<(NodeId, AnyParameterId)>,
-            is_connected_input: bool,
-        ) where
-            DataType: DataTypeTrait<UserState>,
-            UserResponse: UserResponseTrait,
-            NodeData: NodeDataTrait,
-        {
-            let port_type = graph.any_param_type(param_id).unwrap();
-
-            let port_rect = Rect::from_center_size(port_pos, egui::vec2(10.0, 10.0));
-
-            let sense = if ongoing_drag.is_some() {
-                Sense::hover()
-            } else {
-                Sense::click_and_drag()
-            };
-
-            let resp = ui.allocate_rect(port_rect, sense);
-
-            // Check if the distance between the port and the mouse is the distance to connect
-            let close_enough = if let Some(pointer_pos) = ui.ctx().pointer_hover_pos() {
-                port_rect.center().distance(pointer_pos) < DISTANCE_TO_CONNECT
-            } else {
-                false
-            };
-
-            let port_color = if close_enough {
-                Color32::WHITE
-            } else {
-                port_type.data_type_color(user_state)
-            };
-            ui.painter()
-                .circle(port_rect.center(), 5.0, port_color, Stroke::none());
-
-            if resp.drag_started() {
-                if is_connected_input {
-                    let input = param_id.assume_input();
-                    let corresp_output = graph
-                        .connection(input)
-                        .expect("Connection data should be valid");
-                    responses.push(NodeResponse::DisconnectEvent {
-                        input: param_id.assume_input(),
-                        output: corresp_output,
-                    });
-                } else {
-                    responses.push(NodeResponse::ConnectEventStarted(node_id, param_id));
-                }
-            }
-
-            if let Some((origin_node, origin_param)) = ongoing_drag {
-                if origin_node != node_id {
-                    // Don't allow self-loops
-                    if graph.any_param_type(origin_param).unwrap() == port_type
-                        && close_enough
-                        && ui.input().pointer.any_released()
-                    {
-                        match (param_id, origin_param) {
-                            (AnyParameterId::Input(input), AnyParameterId::Output(output))
-                            | (AnyParameterId::Output(output), AnyParameterId::Input(input)) => {
-                                responses.push(NodeResponse::ConnectEventEnded { input, output });
-                            }
-                            _ => { /* Ignore in-in or out-out connections */ }
-                        }
-                    }
-                }
-            }
-
-            port_locations.insert(param_id, port_rect.center());
+        // Movement
+        let drag_delta = window_response.drag_delta();
+        if drag_delta.length_sq() > 0.0 && self.ongoing_drag.is_none() {
+            responses.push(NodeResponse::MoveNode {
+                node: self.node_id,
+                drag_delta,
+            });
+            responses.push(NodeResponse::RaiseNode(self.node_id));
         }
 
-        // Input ports
-        for ((_, param), port_height) in self.graph[self.node_id]
-            .inputs
-            .iter()
-            .zip(input_port_heights.into_iter())
-        {
-            let should_draw = match self.graph[*param].kind() {
-                InputParamKind::ConnectionOnly => true,
-                InputParamKind::ConstantOnly => false,
-                InputParamKind::ConnectionOrConstant => true,
-            };
-
-            if should_draw {
-                let pos_left = pos2(port_left, port_height);
-                draw_port(
-                    ui,
-                    self.graph,
-                    self.node_id,
-                    user_state,
-                    pos_left,
-                    &mut responses,
-                    AnyParameterId::Input(*param),
-                    self.port_locations,
-                    self.ongoing_drag,
-                    self.graph.connection(*param).is_some(),
-                );
-            }
+        // Node selection
+        //
+        // HACK: Only set the select response when no other response is active.
+        // This prevents some issues.
+        if responses.is_empty() && window_response.clicked_by(PointerButton::Primary) {
+            responses.push(NodeResponse::SelectNode(self.node_id));
+            responses.push(NodeResponse::RaiseNode(self.node_id));
         }
-
-        // Output ports
-        for ((_, param), port_height) in self.graph[self.node_id]
-            .outputs
-            .iter()
-            .zip(output_port_heights.into_iter())
-        {
-            let pos_right = pos2(port_right, port_height);
-            draw_port(
-                ui,
-                self.graph,
-                self.node_id,
-                user_state,
-                pos_right,
-                &mut responses,
-                AnyParameterId::Output(*param),
-                self.port_locations,
-                self.ongoing_drag,
-                false,
-            );
-        }
-
         // Draw the background shape.
         // NOTE: This code is a bit more involved than it needs to be because egui
         // does not support drawing rectangles with asymmetrical round corners.
@@ -734,7 +785,7 @@ where
                     .user_data
                     .titlebar_color(ui, self.node_id, self.graph, user_state)
                     .unwrap_or_else(|| background_color.lighten(0.8)),
-                stroke: Stroke::none(),
+                stroke: Stroke::NONE,
             });
 
             let body_rect = Rect::from_min_size(
@@ -745,7 +796,7 @@ where
                 rect: body_rect,
                 rounding: Rounding::none(),
                 fill: background_color,
-                stroke: Stroke::none(),
+                stroke: Stroke::NONE,
             });
 
             let bottom_body_rect = Rect::from_min_size(
@@ -756,7 +807,7 @@ where
                 rect: bottom_body_rect,
                 rounding,
                 fill: background_color,
-                stroke: Stroke::none(),
+                stroke: Stroke::NONE,
             });
 
             let node_rect = titlebar_rect.union(body_rect).union(bottom_body_rect);
@@ -765,7 +816,7 @@ where
                     rect: node_rect.expand(1.0),
                     rounding,
                     fill: Color32::WHITE.lighten(0.8),
-                    stroke: Stroke::none(),
+                    stroke: Stroke::NONE,
                 })
             } else {
                 Shape::Noop
@@ -777,51 +828,15 @@ where
             (Shape::Vec(vec![titlebar, body, bottom_body]), outline)
         };
 
-        ui.painter().set(background_shape, shape);
-        ui.painter().set(outline_shape, outline);
-
-        // --- Interaction ---
-
-        // Titlebar buttons
-        let can_delete = self.graph.nodes[self.node_id].user_data.can_delete(
-            self.node_id,
-            self.graph,
-            user_state,
-        );
-
-        if can_delete && Self::close_button(ui, outer_rect).clicked() {
-            responses.push(NodeResponse::DeleteNodeUi(self.node_id));
-        };
-
-        let window_response = ui.interact(
-            outer_rect,
-            Id::new((self.node_id, "window")),
-            Sense::click_and_drag(),
-        );
-
-        // Movement
-        let drag_delta = window_response.drag_delta();
-        if drag_delta.length_sq() > 0.0 {
-            responses.push(NodeResponse::MoveNode {
-                node: self.node_id,
-                drag_delta,
-            });
-            responses.push(NodeResponse::RaiseNode(self.node_id));
-        }
-
-        // Node selection
-        //
-        // HACK: Only set the select response when no other response is active.
-        // This prevents some issues.
-        if responses.is_empty() && window_response.clicked_by(PointerButton::Primary) {
-            responses.push(NodeResponse::SelectNode(self.node_id));
-            responses.push(NodeResponse::RaiseNode(self.node_id));
-        }
+        let p = ui.painter();
+        p.set(background_shape, shape);
+        p.set(outline_shape, outline);
 
         responses
     }
 
-    fn close_button(ui: &mut Ui, node_rect: Rect) -> Response {
+    fn close_button(ui: &mut Ui) -> Response {
+        let (_, node_rect) = ui.allocate_space(vec2(24.0, 24.0));
         // Measurements
         let margin = 8.0;
         let size = 10.0;
@@ -858,10 +873,9 @@ where
             color,
         };
 
-        ui.painter()
-            .line_segment([rect.left_top(), rect.right_bottom()], stroke);
-        ui.painter()
-            .line_segment([rect.right_top(), rect.left_bottom()], stroke);
+        let p = ui.painter_at(node_rect);
+        p.line_segment([rect.left_top(), rect.right_bottom()], stroke);
+        p.line_segment([rect.right_top(), rect.left_bottom()], stroke);
 
         resp
     }
